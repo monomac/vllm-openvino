@@ -14,7 +14,7 @@ from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
                               init_distributed_environment)
-from vllm.inputs import INPUT_REGISTRY
+# INPUT_REGISTRY removed in v0.11.0, use MULTIMODAL_REGISTRY.get_decoder_dummy_data instead
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.layers.sampler import SamplerOutput
@@ -431,7 +431,6 @@ class OpenVINOWorker(LoRANotSupportedWorkerBase):
         model_config = self.model_config
         parallel_config = self.parallel_config
         device_config = self.device_config
-        input_registry = INPUT_REGISTRY
         mm_registry = MULTIMODAL_REGISTRY
         mm_registry.init_mm_limits_per_prompt(model_config)
 
@@ -470,20 +469,55 @@ class OpenVINOWorker(LoRANotSupportedWorkerBase):
                 block_size = cache_config.block_size
                 seq_num_blocks = (seq_len + block_size - 1) // block_size
 
-                dummy_data = input_registry \
-                    .dummy_data_for_profiling(model_config,
-                                              seq_len,
-                                              mm_registry)
+                # Use new API: mm_registry.get_decoder_dummy_data instead of INPUT_REGISTRY
+                dummy_decoder_data = mm_registry.get_decoder_dummy_data(
+                    model_config=model_config,
+                    seq_len=seq_len,
+                    mm_counts=None,
+                )
 
                 block_tables = [[0] * seq_num_blocks] * max_num_seqs
+                # Create seq_data from dummy_decoder_data
+                # In v0.11.0, seq_data should be a dict mapping seq_id to an object with
+                # prompt_token_ids and methods like get_len() and get_num_computed_tokens()
+                from vllm.sequence import SequenceData
+                try:
+                    # Try to create SequenceData if it exists
+                    seq_data = SequenceData(
+                        prompt_token_ids=dummy_decoder_data.prompt_token_ids,
+                        output_token_ids=[],
+                    )
+                except (ImportError, TypeError, AttributeError):
+                    # Fallback: create a simple object with required attributes/methods
+                    class SimpleSeqData:
+                        def __init__(self, prompt_token_ids):
+                            self.prompt_token_ids = prompt_token_ids
+                            self.output_token_ids = []
+                        
+                        def get_len(self):
+                            return len(self.prompt_token_ids) + len(self.output_token_ids)
+                        
+                        def get_num_computed_tokens(self):
+                            return 0
+                        
+                        def get_token_ids(self):
+                            return self.prompt_token_ids + self.output_token_ids
+                        
+                        def get_last_token_id(self):
+                            if self.output_token_ids:
+                                return self.output_token_ids[-1]
+                            return self.prompt_token_ids[-1] if self.prompt_token_ids else None
+                    
+                    seq_data = SimpleSeqData(dummy_decoder_data.prompt_token_ids)
+                
                 seq = SequenceGroupMetadata(
                     request_id=str(group_id),
                     is_prompt=True,
-                    seq_data={group_id: dummy_data.seq_data},
+                    seq_data={group_id: seq_data},
                     sampling_params=sampling_params,
                     block_tables=block_tables,
                     lora_request=None,
-                    multi_modal_data=dummy_data.multi_modal_data)
+                    multi_modal_data=dummy_decoder_data.multi_modal_data)
                 seqs.append(seq)
 
             self.model_runner.block_size = tmp_cache_config.block_size
